@@ -33,8 +33,13 @@ function messageText(payload) {
   if (typeof payload.message === 'string') return payload.message;
   if (typeof payload.content === 'string') return payload.content;
   return (Array.isArray(payload.content) ? payload.content : [])
-    .filter(item => ['input_text', 'output_text', 'text'].includes(item.type))
-    .map(item => item.text || '').join('\n');
+    .filter(item => item && ['input_text', 'output_text', 'text'].includes(item.type) && typeof item.text === 'string')
+    .map(item => item.text).join('\n');
+}
+
+function isRecord(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && typeof value.type === 'string' && value.payload && typeof value.payload === 'object' && !Array.isArray(value.payload);
 }
 
 function parseLines(text) {
@@ -42,7 +47,11 @@ function parseLines(text) {
   let malformed = 0;
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
-    try { records.push(JSON.parse(line)); } catch { malformed++; }
+    try {
+      const record = JSON.parse(line);
+      if (isRecord(record)) records.push(record);
+      else malformed++;
+    } catch { malformed++; }
   }
   return { records, malformed };
 }
@@ -57,10 +66,15 @@ export function readRecords(file, maxBytes = TAIL_BYTES) {
     const firstLine = firstBuffer.subarray(0, firstCount).toString('utf8').split('\n')[0];
     const first = parseLines(firstLine).records[0];
     const length = Math.min(size, maxBytes);
-    const buffer = Buffer.alloc(length);
-    const count = fs.readSync(fd, buffer, 0, length, size - length);
+    // Read the preceding byte so a tail aligned to a newline keeps its first record.
+    const start = Math.max(0, size - length - 1);
+    const buffer = Buffer.alloc(size - start);
+    const count = fs.readSync(fd, buffer, 0, buffer.length, start);
     let tail = buffer.subarray(0, count).toString('utf8');
-    if (size > length) tail = tail.slice(tail.indexOf('\n') + 1);
+    if (size > length) {
+      const boundary = tail.indexOf('\n');
+      tail = boundary < 0 ? '' : tail.slice(boundary + 1);
+    }
     const parsed = parseLines(tail);
     return { records: size > length && first ? [first, ...parsed.records] : parsed.records,
       malformed: parsed.malformed, truncated: size > length };
@@ -69,35 +83,37 @@ export function readRecords(file, maxBytes = TAIL_BYTES) {
 
 export function extract(records) {
   const result = { id: '', cwd: '', model: '', status: 'unknown', messages: [], lastTimestamp: '' };
-  // Event and response records often contain the same message. Deduplicate only
-  // across formats within a turn, preserving intentional repeated user messages.
-  let turn = 0;
-  const seen = new Map();
+  // Pair only adjacent conversational records from opposite formats. Remembering
+  // all prior text can erase a real later request when a log switches formats.
+  let previous = null;
   for (const record of records) {
+    if (!isRecord(record)) continue;
     const p = record.payload || {};
     if (record.timestamp && record.timestamp > result.lastTimestamp) result.lastTimestamp = record.timestamp;
     if (record.type === 'session_meta') { result.id = p.id || p.session_id || ''; result.cwd = p.cwd || ''; }
     if (record.type === 'turn_context') { result.cwd = p.cwd || result.cwd; result.model = p.model || result.model; }
     if (record.type === 'event_msg') {
-      if (p.type === 'task_started') { turn++; result.status = 'in_progress'; }
+      if (['task_started', 'task_complete', 'turn_aborted'].includes(p.type)) previous = null;
+      if (p.type === 'task_started') result.status = 'in_progress';
       if (p.type === 'task_complete') result.status = 'turn_complete';
       if (p.type === 'turn_aborted') result.status = 'interrupted';
     }
     let role;
     if (record.type === 'event_msg' && ['user_message', 'agent_message'].includes(p.type)) role = p.type === 'user_message' ? 'user' : 'assistant';
     if (record.type === 'response_item' && p.type === 'message' && ['user', 'assistant'].includes(p.role)) {
-      if (p.role === 'assistant' && !['final', 'commentary', undefined, null].includes(p.phase ?? p.channel)) continue;
       role = p.role;
     }
     if (!role) continue;
+    if (role === 'assistant' && !['final', 'commentary', undefined, null].includes(p.phase ?? p.channel)) continue;
     const raw = messageText(p);
-    if (/^\s*(?:# AGENTS\.md instructions|<INSTRUCTIONS>|<environment_context>|<permissions instructions>)/i.test(raw)) continue;
     const text = cleanText(raw);
+    if (/^\s*(?:# AGENTS\.md instructions|<INSTRUCTIONS>|<environment_context>|<permissions instructions>)/i.test(text)) continue;
     if (!text) continue;
-    const key = `${turn}:${role}:${text}`;
-    const previous = seen.get(key);
-    if (previous && previous !== record.type) { seen.delete(key); continue; }
-    seen.set(key, record.type);
+    if (previous?.role === role && previous.raw === raw && previous.format !== record.type) {
+      previous = null;
+      continue;
+    }
+    previous = { role, raw, format: record.type };
     if (role === 'user') result.status = 'in_progress';
     result.messages.push({ role, timestamp: record.timestamp || '', text: text.length > TEXT_LIMIT ? `${text.slice(0, TEXT_LIMIT)}\n[message truncated]` : text });
   }
@@ -147,6 +163,9 @@ export function render(session, source, warnings = []) {
 
 export function atomicWrite(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (fs.existsSync(file) && !fs.readFileSync(file, 'utf8').startsWith('# Codex handoff capsule\n')) {
+    throw new Error('Output exists and is not a capsule generated by this tool. Choose a different --output path.');
+  }
   const temp = `${file}.${randomUUID()}.tmp`;
   try {
     fs.writeFileSync(temp, text, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
