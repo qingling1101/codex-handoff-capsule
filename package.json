@@ -1,0 +1,9 @@
+{
+  "name": "codex-handoff-capsule",
+  "version": "1.0.0",
+  "description": "Local, bounded handoff notes for continuing Codex work across sessions.",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node --test", "capsule": "node scripts/update-capsule.mjs" }
+}

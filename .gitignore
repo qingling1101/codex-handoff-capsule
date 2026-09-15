@@ -1,0 +1,10 @@
+node_modules/
+.codex/
+handoffs/
+sessions/
+archived_sessions/
+*.jsonl
+*.tmp
+*.bak
+.env*
+coverage/
