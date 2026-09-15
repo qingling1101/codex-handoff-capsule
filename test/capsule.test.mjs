@@ -82,3 +82,57 @@ test('session discovery includes archived sessions and more than 16 files', t =>
   const target = path.join(archive, 'old.jsonl'); fs.writeFileSync(target, JSON.stringify(f.meta));
   assert.equal(chooseSession(f.root, f.root), target);
 });
+
+test('JSON null and scalar records are ignored instead of crashing', t => {
+  const f = fixture(t); f.write([f.meta, null, 17, [], response('user', 'still usable')]);
+  const run = f.run('--stdout');
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /still usable/);
+});
+test('tail starting on a record boundary retains that whole record', t => {
+  const f = fixture(t);
+  const last = JSON.stringify(response('user', 'boundary message')) + '\n';
+  fs.writeFileSync(f.file, JSON.stringify(f.meta) + '\n' + last);
+  const result = extract(readRecords(f.file, Buffer.byteLength(last)).records);
+  assert.equal(result.messages[0]?.text, 'boundary message');
+});
+test('same words in later conversations are not mistaken for old mirrors', () => {
+  const result = extract([event('user_message', 'continue'), event('agent_message', 'first result'),
+    response('user', 'continue'), response('assistant', 'second result')]);
+  assert.deepEqual(result.messages.map(x => x.text), ['continue', 'first result', 'continue', 'second result']);
+});
+test('setup prefixed with a plugin catalog is still excluded', () => {
+  const text = '<recommended_plugins>catalog</recommended_plugins>\n# AGENTS.md instructions for demo\nPRIVATE SETUP';
+  assert.equal(extract([response('user', text)]).messages.length, 0);
+});
+test('explicit output cannot overwrite an unrelated Markdown document', t => {
+  const f = fixture(t); f.write([f.meta, response('user', 'hello')]);
+  const out = path.join(f.root, 'README.md'); fs.writeFileSync(out, '# Important project notes');
+  const run = f.run('--output', out);
+  assert.equal(run.status, 1);
+  assert.equal(fs.readFileSync(out, 'utf8'), '# Important project notes');
+});
+
+test('an existing generated capsule can be refreshed', t => {
+  const f = fixture(t); const out = path.join(f.root, 'capsule.md');
+  f.write([f.meta, response('user', 'first message')]);
+  assert.equal(f.run('--output', out).status, 0);
+  f.write([f.meta, response('user', 'second message')]);
+  assert.equal(f.run('--output', out).status, 0);
+  assert.match(fs.readFileSync(out, 'utf8'), /second message/);
+});
+test('invalid content blocks do not discard valid text', () => {
+  const record = response('user', 'valid text');
+  record.payload.content.unshift(null, { type: 'input_text', text: 42 });
+  assert.equal(extract([record]).messages[0].text, 'valid text');
+});
+test('identical messages across explicit turns are preserved', () => {
+  const result = extract([event('task_started'), event('user_message', 'continue'), event('task_complete'),
+    event('task_started'), response('user', 'continue')]);
+  assert.equal(result.messages.length, 2);
+});
+test('event-format analysis is excluded as well as response-format analysis', () => {
+  const record = event('agent_message', 'fictional internal reasoning');
+  record.payload.phase = 'analysis';
+  assert.equal(extract([record]).messages.length, 0);
+});
